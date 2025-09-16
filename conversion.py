@@ -1,10 +1,156 @@
+from pathlib import Path
+import math
 import torch
 import torch.nn as nn
-from pathlib import Path
+import torch.nn.functional as F
 from typing import Optional
 from safetensors import safe_open
+from safetensors.torch import save_file
 from transformers import PreTrainedTokenizerFast
-from core import MoEModelConfig, SwiGLU, RMSNorm, Attention
+from dataclasses import dataclass
+
+    
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        """
+        LlamaRMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
+@dataclass
+class MoEModelConfig:
+    # -----------------------------
+    # Core parameters 
+    # -----------------------------
+    head_dim: int = 64
+    hidden_size: int = 896
+    intermediate_size: int = 4864
+    max_position_embeddings: int = 32768
+    num_attention_heads: int = 14
+    num_hidden_layers: int = 24
+    num_key_value_heads: int = 2
+    rms_norm_eps: float = 1e-05
+    vocab_size: int = 151936
+    pad_token_id: int = 151643
+
+    # -----------------------------
+    # MoE (Mixture of Experts) parameters
+    # -----------------------------
+    use_moe: bool =False
+    n_routed_experts: int = 4
+    n_shared_experts: int = 1
+    num_experts_per_tok: int = 2
+    n_group: int = 2
+    topk_group: int = 1
+
+class Attention(nn.Module):
+    """
+    Multi-head attention layer with support for GQA (grouped-query attention).
+    Compatible with LLaMA/Mistral style configs (num_heads, num_kv_heads).
+    """
+
+    def __init__(self, config, layer_idx: int):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.layer_idx = layer_idx
+
+        if self.hidden_size % self.num_heads != 0:
+            raise ValueError("hidden_size must be divisible by num_heads")
+
+        # QKV projections
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=True)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=True)
+
+        # Output projection
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+
+        # Scaling factor
+        self.scale = 1.0 / math.sqrt(self.head_dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        output_attentions: bool = False,
+    ):
+        bsz, seq_len, _ = x.size()
+
+        # Project Q, K, V
+        q = self.q_proj(x).view(bsz, seq_len, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(x).view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+
+        # Transpose for attention computation: [bsz, num_heads, seq_len, head_dim]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        # Repeat k/v heads if num_kv_heads < num_heads (GQA)
+        if self.num_kv_heads != self.num_heads:
+            k = k.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+            v = v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+
+        # Compute attention scores
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+
+        # Apply mask (causal mask is [1,1,seq_len,seq_len])
+        if attention_mask is not None:
+            attn_scores = attn_scores + attention_mask
+
+        # Softmax
+        attn_probs = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
+
+        # Weighted sum of values
+        attn_output = torch.matmul(attn_probs, v)
+
+        # Reshape back to [bsz, seq_len, hidden_size]
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, self.hidden_size)
+
+        # Output projection
+        attn_output = self.o_proj(attn_output)
+
+        return (attn_output, attn_probs) if output_attentions else (attn_output, None)
+
+class SwiGLU(nn.Module):
+    """
+    SwiGLU MLP block with down/up projection + gate.
+    Implements:
+        y = down_proj( swish(gate_proj(x)) * up_proj(x) )
+    where swish(x) = x * sigmoid(x).
+    """
+    def __init__(self, config, bias: bool = False):
+        super().__init__()
+        hidden_size = config.hidden_size
+        intermediate_size = config.intermediate_size
+
+        # Standard naming: gate, up, and down projections
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=bias)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=bias)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate = F.silu(self.gate_proj(x))
+        up = self.up_proj(x)
+        x = gate * up  # elementwise product
+        return self.down_proj(x)
+
 
 class SwiGLUMoE(nn.Module):
     """
@@ -15,7 +161,7 @@ class SwiGLUMoE(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        self.intermediate_size = config.moe_intermediate_size
+        self.intermediate_size = config.intermediate_size
         self.num_experts = config.n_routed_experts
         self.num_experts_per_tok = config.num_experts_per_tok
 
@@ -295,8 +441,6 @@ def copy_dense_to_moe(dense_model, moe_model):
     moe_model.load_state_dict(new_state_dict, strict=False)
     return moe_model
 
-from safetensors.torch import save_file
-
 def save_moe_model(model, path="moe.safetensors"):
     """
     Saves a Transformer model to safetensors format,
@@ -365,17 +509,6 @@ if __name__ == "__main__":
         num_attention_heads=14,
         num_key_value_heads=2,
         vocab_size=151936,
-        max_position_embeddings=32768,
-        rope_theta=1000000.0,
-        rope_type="llama3",
-        factor=8.0,
-        low_freq_factor=1.0,
-        high_freq_factor=4.0,
-        original_max_position_embeddings=8192,
-        rope_partial_ratio=1.0,
-        sliding_window=None,
-        dropout=0.0,
-        use_lora=False,
     )
 
     # MoE config 
@@ -386,25 +519,12 @@ if __name__ == "__main__":
         num_attention_heads=14,
         num_key_value_heads=2,
         vocab_size=151936,
-        max_position_embeddings=32768,
-        rope_theta=1000000.0,
-        rope_type="llama3",
-        factor=8.0,
-        low_freq_factor=1.0,
-        high_freq_factor=4.0,
-        original_max_position_embeddings=8192,
-        rope_partial_ratio=1.0,
-        sliding_window=None,
-        dropout=0.0,
-        use_lora=False,
 
         # MoE-specific params
         use_moe=True,
         n_routed_experts=4,
         n_shared_experts=1,
-        moe_intermediate_size=4864,
         num_experts_per_tok=2,
-        router_scaling_factor=1.0,
         n_group=2,
         topk_group=1,
     )
@@ -461,4 +581,3 @@ if __name__ == "__main__":
     output = generate_text(moe_model_reloaded, tokenizer, "The future of AI is", max_new_tokens=50)
     print("=== Generated Text ===")
     print(output)
-
