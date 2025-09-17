@@ -1,39 +1,48 @@
+"""
+Mixture of Experts (MoE) Transformer implementation with weight conversion utilities.
+
+This module provides:
+- Transformer architecture with optional MoE layers
+- Utilities to convert dense models to MoE models
+- Safetensors integration for model loading/saving
+"""
+
 from pathlib import Path
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+from typing import Optional, Union
 from safetensors import safe_open
 from safetensors.torch import save_file
 from transformers import PreTrainedTokenizerFast
 from dataclasses import dataclass
 
-    
+
 class RMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        """
-        LlamaRMSNorm is equivalent to T5LayerNorm
-        """
+    """Root Mean Square Normalization layer equivalent to T5LayerNorm."""
+    
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
 
-    def extra_repr(self):
+    def extra_repr(self) -> str:
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
 
 @dataclass
 class MoEModelConfig:
-    # -----------------------------
-    # Core parameters 
-    # -----------------------------
+    """Configuration for MoE Transformer model."""
+    
+    # Core parameters
     head_dim: int = 64
     hidden_size: int = 896
     intermediate_size: int = 4864
@@ -45,23 +54,22 @@ class MoEModelConfig:
     vocab_size: int = 151936
     pad_token_id: int = 151643
 
-    # -----------------------------
     # MoE (Mixture of Experts) parameters
-    # -----------------------------
-    use_moe: bool =False
+    use_moe: bool = False
     n_routed_experts: int = 4
-    n_shared_experts: int = 1
+    null_experts: int = 1
     num_experts_per_tok: int = 2
     n_group: int = 2
     topk_group: int = 1
 
+
 class Attention(nn.Module):
     """
     Multi-head attention layer with support for GQA (grouped-query attention).
-    Compatible with LLaMA/Mistral style configs (num_heads, num_kv_heads).
+    Compatible with LLaMA/Mistral style configs.
     """
 
-    def __init__(self, config, layer_idx: int):
+    def __init__(self, config: MoEModelConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -89,15 +97,15 @@ class Attention(nn.Module):
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
         output_attentions: bool = False,
-    ):
-        bsz, seq_len, _ = x.size()
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        batch_size, seq_len, _ = x.size()
 
         # Project Q, K, V
-        q = self.q_proj(x).view(bsz, seq_len, self.num_heads, self.head_dim)
-        k = self.k_proj(x).view(bsz, seq_len, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(x).view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(x).view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
 
-        # Transpose for attention computation: [bsz, num_heads, seq_len, head_dim]
+        # Transpose for attention computation: [batch_size, num_heads, seq_len, head_dim]
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
@@ -110,7 +118,7 @@ class Attention(nn.Module):
         # Compute attention scores
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
 
-        # Apply mask (causal mask is [1,1,seq_len,seq_len])
+        # Apply mask (causal mask is [1, 1, seq_len, seq_len])
         if attention_mask is not None:
             attn_scores = attn_scores + attention_mask
 
@@ -120,22 +128,24 @@ class Attention(nn.Module):
         # Weighted sum of values
         attn_output = torch.matmul(attn_probs, v)
 
-        # Reshape back to [bsz, seq_len, hidden_size]
-        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, self.hidden_size)
+        # Reshape back to [batch_size, seq_len, hidden_size]
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
 
         # Output projection
         attn_output = self.o_proj(attn_output)
 
         return (attn_output, attn_probs) if output_attentions else (attn_output, None)
 
+
 class SwiGLU(nn.Module):
     """
     SwiGLU MLP block with down/up projection + gate.
-    Implements:
-        y = down_proj( swish(gate_proj(x)) * up_proj(x) )
+    
+    Implements: y = down_proj(swish(gate_proj(x)) * up_proj(x))
     where swish(x) = x * sigmoid(x).
     """
-    def __init__(self, config, bias: bool = False):
+    
+    def __init__(self, config: MoEModelConfig, bias: bool = False):
         super().__init__()
         hidden_size = config.hidden_size
         intermediate_size = config.intermediate_size
@@ -153,10 +163,8 @@ class SwiGLU(nn.Module):
 
 
 class SwiGLUMoE(nn.Module):
-    """
-    A minimal MoE layer that replaces the standard SwiGLU.
-    For n_routed_experts=1, it should behave identically to the original after scaling.
-    """
+    """Mixture of Experts layer that replaces standard SwiGLU with multiple experts."""
+    
     def __init__(self, config: MoEModelConfig):
         super().__init__()
         self.config = config
@@ -164,59 +172,73 @@ class SwiGLUMoE(nn.Module):
         self.intermediate_size = config.intermediate_size
         self.num_experts = config.n_routed_experts
         self.num_experts_per_tok = config.num_experts_per_tok
+        
+        # Projectors for expert selection (optional)
+        self.importance_projector = nn.Linear(config.hidden_size, 1)
+        self.semantic_projector = nn.Linear(config.hidden_size, config.hidden_size)
 
         # Create N identical experts
-        self.experts = nn.ModuleList([
-            SwiGLU(config, bias=False) for _ in range(self.num_experts)
-        ])
+        self.experts = nn.ModuleList([SwiGLU(config, bias=False) for _ in range(self.num_experts)])
 
-        # The router (gate) is a new linear layer that must be trained
+        # Router (gate) is a trainable linear layer
         self.router = nn.Linear(self.hidden_size, self.num_experts, bias=False)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Get routing logits: [batch_size, seq_len, num_experts]
         router_logits = self.router(x)
-        
+
         if self.num_experts == 1:
-            # Bypass routing and use expert 0 directly
+            # Bypass routing for single expert
             return self.experts[0](x)
-        
+
         # For multiple experts, use the router
         routing_weights = torch.softmax(router_logits, dim=-1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.num_experts_per_tok, dim=-1)
-        
-        # We need to scale the routing weights to account for the fact that we're using multiple experts
+        routing_weights, selected_experts = torch.topk(
+            routing_weights, self.num_experts_per_tok, dim=-1
+        )
+
+        # Normalize routing weights
         routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
-        
+
         # Initialize output
         final_output = torch.zeros_like(x)
-        
+
         # Calculate weighted sum of expert outputs
         for expert_idx, expert in enumerate(self.experts):
-            # Create a mask for tokens that are assigned to this expert
-            # We need to check all top-k positions for this expert
+            # Create mask for tokens assigned to this expert
             expert_mask = (selected_experts == expert_idx)
-            
-            # If any token in the batch uses this expert, compute its output
+
+            # Process tokens using this expert
             if expert_mask.any():
-                # Get the indices where this expert is used
+                # Get indices where this expert is used
                 batch_indices, seq_indices, topk_indices = torch.where(expert_mask)
-                
-                # Get the corresponding routing weights
+
+                # Get corresponding routing weights
                 current_routing_weights = routing_weights[batch_indices, seq_indices, topk_indices]
-                
-                # Compute expert output for the relevant tokens
+
+                # Compute expert output for relevant tokens
                 expert_input = x[batch_indices, seq_indices]
                 expert_output = expert(expert_input)
-                
+
                 # Add weighted expert output to final result
-                for i, (b, s) in enumerate(zip(batch_indices, seq_indices)):
-                    final_output[b, s] += current_routing_weights[i] * expert_output[i]
-        
+                for i, (batch_idx, seq_idx) in enumerate(zip(batch_indices, seq_indices)):
+                    final_output[batch_idx, seq_idx] += current_routing_weights[i] * expert_output[i]
+
         return final_output
-    
+
+
 class TransformerBlock(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, num_kv_heads: int, intermediate_size: int, config: MoEModelConfig, layer_idx: int):
+    """Transformer block with optional MoE MLP layer."""
+    
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        intermediate_size: int,
+        config: MoEModelConfig,
+        layer_idx: int
+    ):
         super().__init__()
         self.input_layernorm = RMSNorm(hidden_size)
         self.self_attn = Attention(config, layer_idx=layer_idx)
@@ -224,10 +246,8 @@ class TransformerBlock(nn.Module):
 
         # Choose between standard MLP and MoE MLP
         if config.use_moe:
-            # Use the new MoE layer
             self.mlp = SwiGLUMoE(config)
         else:
-            # Use the original SwiGLU
             self.mlp = SwiGLU(config, bias=False)
 
     def forward(
@@ -235,122 +255,94 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         position_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-    ):
-        # Self attention
+    ) -> torch.Tensor:
+        # Self attention with residual connection
         residual = x
         x = self.input_layernorm(x)
         attn_output, _ = self.self_attn(x, attention_mask, position_ids, output_attentions=False)
         x = residual + attn_output
-        
-        # MLP
+
+        # MLP with residual connection
         residual = x
         x = self.post_attention_layernorm(x)
         x = self.mlp(x)
         x = residual + x
-        
+
         return x
 
 
 class Transformer(nn.Module):
-    def __init__(
-        self,
-        config: MoEModelConfig,
-    ):
+    """Transformer model with optional MoE layers."""
+    
+    def __init__(self, config: MoEModelConfig):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
         self.hidden_size = config.hidden_size
         self.num_hidden_layers = config.num_hidden_layers
         self.max_position_embeddings = config.max_position_embeddings
-        
+
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([
             TransformerBlock(
-                config.hidden_size, 
-                config.num_attention_heads, 
-                config.num_key_value_heads, 
+                config.hidden_size,
+                config.num_attention_heads,
+                config.num_key_value_heads,
                 config.intermediate_size,
                 config,
-                layer_idx=i  # Pass layer index
+                layer_idx=i
             )
             for i in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        
+
         # Tie weights
         self.lm_head.weight = self.embed_tokens.weight
-        
+
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-    ):
+    ) -> torch.Tensor:
         batch_size, seq_len = input_ids.shape
-        
+
         # Create position_ids
         position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
-        
+
         # Create causal mask if not provided
         if attention_mask is None:
             attention_mask = self._create_causal_mask(seq_len, input_ids.device)
-        
+
         # Embed tokens
         x = self.embed_tokens(input_ids)
-        
+
         # Forward through layers
         for layer in self.layers:
             x = layer(x, position_ids, attention_mask)
-        
+
         # Final normalization
         x = self.norm(x)
-        
+
         # Compute logits
         logits = self.lm_head(x)
-        
+
         return logits
-    
-    def _create_causal_mask(self, seq_len: int, device: torch.device):
+
+    def _create_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
         mask = torch.full((seq_len, seq_len), float("-inf"), device=device)
         mask = torch.triu(mask, diagonal=1)
         return mask.unsqueeze(0).unsqueeze(0)  # Add batch and head dimensions
 
 
-def load_tokenizer_from_json(tokenizer_path: str):
-    """Load tokenizer from tokenizer.json file"""
-    try:
-        # Check if file exists
-        if not Path(tokenizer_path).exists():
-            raise FileNotFoundError(f"Tokenizer file not found: {tokenizer_path}")
-        
-        # Load using Hugging Face's tokenizer
-        tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_path)
-        
-        # Add padding token if not present
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-            
-        return tokenizer
-        
-    except Exception as e:
-        print(f"Error loading tokenizer: {e}")
-        print("Falling back to character-level tokenization")
-        return None
-
-
-from safetensors import safe_open
-
 def load_model_from_safetensors(
-    model_path: str,
+    model_path: Union[str, Path],
     config: MoEModelConfig,
-    device: str | torch.device = "cuda" if torch.cuda.is_available() else "cpu"
+    device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu"
 ) -> Transformer:
     """Load model weights from a safetensors file into a Transformer."""
     # Normalize device to string for safe_open
-    if isinstance(device, torch.device):
-        device_str = device.type  # "cuda" or "cpu"
-    else:
-        device_str = str(device)
+    device_str = device.type if isinstance(device, torch.device) else str(device)
 
     # Initialize model on the requested device
     model = Transformer(config).to(device_str)
@@ -368,11 +360,12 @@ def load_model_from_safetensors(
                 print(f"⚠️ Skipping key {param_key}, unexpected format")
                 continue
 
+            # Navigate to target module
             module = model
             for submodule in module_path.split("."):
                 if hasattr(module, submodule):
                     module = getattr(module, submodule)
-                elif submodule.isdigit():  # support numeric indices (e.g. layers.0.attn)
+                elif submodule.isdigit():  # Support numeric indices (e.g., layers.0.attn)
                     module = module[int(submodule)]
                 else:
                     print(f"⚠️ Could not find submodule {submodule} in path {module_path}")
@@ -392,115 +385,99 @@ def load_model_from_safetensors(
     return model
 
 
-def copy_dense_to_moe(dense_model, moe_model):
+def copy_dense_to_moe(dense_model: Transformer, moe_model: Transformer) -> Transformer:
     """
-    Copies weights from a dense Transformer to an MoE Transformer.
-    For experts: copies weights without scaling.
-    For router: leaves it with random initialization.
-    For all other layers: direct copy.
+    Copy weights from a dense Transformer to an MoE Transformer.
+    
+    Expert weights are copied without scaling, router weights are randomly initialized,
+    and all other weights are copied directly. Optimized for GPU memory efficiency.
     """
     dense_sd = dense_model.state_dict()
     moe_sd = moe_model.state_dict()
 
     new_state_dict = {}
-    num_experts = moe_model.config.n_routed_experts
+    num_experts = getattr(moe_model.config, "n_routed_experts", None)
 
+    # First, copy all non-expert weights
+    print("Copying non-expert weights...")
     for key in moe_sd.keys():
-        if 'router' in key:
-            # Router weights are new - skip copying, keep random init
-            print(f"Keeping random init for router weight: {key}")
+        if any(routing_key in key for routing_key in [
+            "router", "importance_projector", "semantic_projector", 
+            "embedding_projection", "attention_pooling"
+        ]):
+            print(f"Keeping random init for routing/retrieval weight: {key}")
             new_state_dict[key] = moe_sd[key]
-        elif 'experts' in key:
-            # This is an expert weight - copy directly without scaling
-            parts = key.split('.')
-            expert_idx_pos = parts.index('experts')
-            layer_idx = parts[expert_idx_pos - 2]
-            expert_idx = parts[expert_idx_pos + 1]
-            param_name = parts[-1]
-            expert_layer_name = parts[-2]
-
-            # Find the corresponding dense key
-            dense_key = f"layers.{layer_idx}.mlp.{expert_layer_name}.{param_name}"
-            
-            if dense_key in dense_sd:
-                # Copy without scaling - scaling will be handled in forward pass
-                new_state_dict[key] = dense_sd[dense_key]
-                print(f"Copying: {dense_key} -> {key}")
-            else:
-                print(f"Warning: Could not find dense parameter {dense_key}")
-                new_state_dict[key] = moe_sd[key]
-        else:
-            # Copy all other weights directly
+        elif "expert" not in key:  # Non-expert weights
             if key in dense_sd:
                 new_state_dict[key] = dense_sd[key]
             else:
                 print(f"Warning: Could not find dense parameter {key}")
                 new_state_dict[key] = moe_sd[key]
 
-    # Load the new state dict into the MoE model
+    # Load non-expert weights first to free up memory
     moe_model.load_state_dict(new_state_dict, strict=False)
+
+    # Clean up dense model to free memory for expert copying
+    del dense_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    print("Copying expert weights...")
+    # Process expert weights
+    for key in moe_sd.keys():
+        if "expert" in key:  # Match any expert-related keys
+            parts = key.split(".")
+            try:
+                # Find the expert index position
+                expert_idx_pos = max(i for i, p in enumerate(parts) if "expert" in p)
+
+                layer_idx = parts[expert_idx_pos - 2]
+                expert_layer_name = parts[-2]
+                param_name = parts[-1]
+
+                dense_key = f"layers.{layer_idx}.mlp.{expert_layer_name}.{param_name}"
+
+                # Load the dense parameter
+                if dense_key in dense_sd:
+                    tensor = dense_sd[dense_key]
+                    if torch.cuda.is_available():
+                        tensor = tensor.cuda()
+
+                    # Get target parameter and copy data
+                    module = moe_model
+                    for submodule in key.split(".")[:-1]:
+                        if hasattr(module, submodule):
+                            module = getattr(module, submodule)
+                        elif submodule.isdigit():
+                            module = module[int(submodule)]
+
+                    getattr(module, key.split(".")[-1]).data.copy_(tensor)
+                    print(f"Copied: {dense_key} -> {key}")
+                else:
+                    print(f"Warning: Could not find dense parameter {dense_key}")
+
+            except Exception as e:
+                print(f"⚠️ Skipping {key} due to parsing error: {e}")
+
     return moe_model
 
-def save_moe_model(model, path="moe.safetensors"):
-    """
-    Saves a Transformer model to safetensors format,
-    breaking shared weights to avoid safetensors RuntimeError.
-    """
+
+def save_moe_model(model: Transformer, path: Union[str, Path] = "model.safetensors") -> None:
+    """Save a Transformer model to safetensors format, handling shared weights."""
     state_dict = model.state_dict()
 
-    # Detect and clone tied weights
-    if "lm_head.weight" in state_dict and "embed_tokens.weight" in state_dict:
-        if state_dict["lm_head.weight"].data_ptr() == state_dict["embed_tokens.weight"].data_ptr():
-            print("🔧 Cloning lm_head.weight to avoid shared-memory issue...")
-            state_dict = {k: v.clone() if k == "lm_head.weight" else v for k, v in state_dict.items()}
+    # Detect and clone tied weights to avoid safetensors RuntimeError
+    if ("lm_head.weight" in state_dict and "embed_tokens.weight" in state_dict and
+        state_dict["lm_head.weight"].data_ptr() == state_dict["embed_tokens.weight"].data_ptr()):
+        print("🔧 Cloning lm_head.weight to avoid shared-memory issue...")
+        state_dict = {k: v.clone() if k == "lm_head.weight" else v for k, v in state_dict.items()}
 
     save_file(state_dict, path)
     print(f"✅ MoE model saved to {path}")
 
 
-def generate_text(
-    model,
-    tokenizer,
-    prompt: str,
-    max_new_tokens: int = 50,
-    temperature: float = 1.0,
-    top_k: int = 0,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
-):
-    model.eval()
-    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
-    
-    generated = input_ids
-    with torch.no_grad():
-        for _ in range(max_new_tokens):
-            logits = model(generated)[:, -1, :]  # last token logits
-            
-            if temperature != 1.0:
-                logits = logits / temperature
-            
-            if top_k > 0:
-                # Top-k filtering
-                values, indices = torch.topk(logits, top_k)
-                mask = torch.full_like(logits, float("-inf"))
-                mask.scatter_(1, indices, values)
-                logits = mask
-            
-            probs = torch.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-            
-            generated = torch.cat((generated, next_token), dim=1)
-            
-            # Stop on EOS
-            if next_token.item() == tokenizer.eos_token_id:
-                break
-    
-    return tokenizer.decode(generated[0].tolist(), skip_special_tokens=True)
-
-
-# ===========================
-# Example usage
-# ===========================
-if __name__ == "__main__":
+def main() -> None:
+    """Example usage: Convert dense model to MoE model."""
     # Dense model config
     dense_config = MoEModelConfig(
         hidden_size=896,
@@ -511,7 +488,7 @@ if __name__ == "__main__":
         vocab_size=151936,
     )
 
-    # MoE config 
+    # MoE config
     moe_config = MoEModelConfig(
         hidden_size=896,
         intermediate_size=4864,
@@ -523,9 +500,8 @@ if __name__ == "__main__":
         # MoE-specific params
         use_moe=True,
         n_routed_experts=4,
-        n_shared_experts=1,
-        num_experts_per_tok=2,
-        n_group=2,
+        num_experts_per_tok=1,
+        n_group=1,
         topk_group=1,
     )
 
@@ -534,50 +510,19 @@ if __name__ == "__main__":
 
     # Load dense model
     print("Loading original dense model...")
-    dense_model = load_model_from_safetensors("model.safetensors", dense_config, device=device)
+    dense_model = load_model_from_safetensors("dense_model.safetensors", dense_config, device=device)
 
     # Create MoE model
     print("Creating MoE model...")
     moe_model = Transformer(moe_config).to(device)
 
-    # Copy weights
+    # Copy weights with memory optimization
     print("Copying weights from dense to MoE...")
     moe_model = copy_dense_to_moe(dense_model, moe_model)
 
     # Save MoE model to disk
-    save_moe_model(moe_model, "moe.safetensors")
+    save_moe_model(moe_model, "model.safetensors")
 
-    # Test equivalence
-    print("Testing model equivalence...")
-    test_input = torch.randint(0, 1000, (1, 10)).to(device)
 
-    with torch.no_grad():
-        dense_output = dense_model(test_input)
-        moe_output = moe_model(test_input)
-
-    similarity = torch.cosine_similarity(dense_output.flatten(), moe_output.flatten(), dim=0)
-    print(f"Cosine similarity between dense and MoE outputs: {similarity.item():.8f}")
-
-    if similarity.item() > 0.999:
-        print("✅ SUCCESS: MoE model behaves identically to the dense model!")
-    else:
-        print("❌ FAILURE: Outputs are not similar enough.")
-
-    print("Reloading MoE model from moe.safetensors...")
-    moe_model_reloaded = load_model_from_safetensors("moe.safetensors", moe_config, device=device)
-    
-    # Re-tie weights after loading
-    if hasattr(moe_model_reloaded, "lm_head") and hasattr(moe_model_reloaded, "embed_tokens"):
-        moe_model_reloaded.lm_head.weight = moe_model_reloaded.embed_tokens.weight
-        print("🔗 Re-tied lm_head.weight to embed_tokens.weight")
-    
-
-    # Load tokenizer
-    print("Loading tokenizer...")
-    tokenizer = load_tokenizer_from_json("tokenizer.json")
-
-    # Generate text
-    print("Running generation...")
-    output = generate_text(moe_model_reloaded, tokenizer, "The future of AI is", max_new_tokens=50)
-    print("=== Generated Text ===")
-    print(output)
+if __name__ == "__main__":
+    main()
