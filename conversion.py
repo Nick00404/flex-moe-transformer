@@ -1,264 +1,13 @@
 from pathlib import Path
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Union, Tuple
+from typing import Optional, Union
 from safetensors import safe_open
 from safetensors.torch import save_file
-from transformers import PreTrainedTokenizerFast
-from dataclasses import dataclass
+from transformers.modeling_outputs import CausalLMOutput
+from modeling_custom_model import MoE, MoEOutput, RMSNorm, MLP, Attention, MoEModelConfig
 
-
-class RMSNorm(nn.Module):
-    """Root Mean Square Normalization layer equivalent to T5LayerNorm."""
-    
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
-
-    def extra_repr(self) -> str:
-        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
-
-
-@dataclass
-class MoEModelConfig:
-    """Configuration for MoE Transformer model."""
-    # Core parameters
-    hidden_size: int = 896
-    intermediate_size: int = 4864
-    max_position_embeddings: int = 32768
-    num_attention_heads: int = 14
-    num_hidden_layers: int = 24
-    num_key_value_heads: int = 2
-    rms_norm_eps: float = 1e-05
-    vocab_size: int = 151936
-    pad_token_id: int = 151643
-    dropout: float = 0.0
-
-    # MoE (Mixture of Experts) parameters
-    use_moe: bool = False
-    n_routed_experts: int = 4
-    num_experts_per_tok: int = 2
-    n_group: int = 2
-    topk_group: int = 1
-
-class MLP(nn.Module):
-    """
-    MLP block with down/up projection + gate.
-    
-    Implements: y = down_proj(swish(gate_proj(x)) * up_proj(x))
-    where swish(x) = x * sigmoid(x).
-    """
-    
-    def __init__(self, config: MoEModelConfig, bias: bool = False):
-        super().__init__()
-        hidden_size = config.hidden_size
-        intermediate_size = config.intermediate_size
-        dropout = config.dropout
-        
-        # Use standard nn.Linear layers
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=bias)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=bias)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=bias)
-        
-        self.dropout = nn.Dropout(dropout)
-        self.act_fn = F.silu
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate = self.gate_proj(x)
-        up = self.up_proj(x)
-        activated = self.act_fn(gate) * up
-        dropped = self.dropout(activated)
-        output = self.down_proj(dropped)
-        return output
-
-
-class MoE(nn.Module):
-    """Mixture of Experts layer that replaces standard MLP with multiple experts."""
-    
-    def __init__(self, config: MoEModelConfig):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.n_routed_experts = config.n_routed_experts
-        self.num_experts_per_tok = config.num_experts_per_tok
-
-        # Projectors for expert selection
-        self.importance_projector = nn.Linear(config.hidden_size, 1)
-        self.semantic_projector = nn.Linear(config.hidden_size, config.hidden_size)
-        bias_tensor = torch.zeros(config.n_routed_experts)
-        self.e_score_correction_bias = nn.Parameter(bias_tensor)
-
-        # Create N identical experts
-        self.experts = nn.ModuleList([MLP(config, bias=False) for _ in range(self.n_routed_experts)])
-
-        # Number of special experts
-        self.shared_expert_count = 1
-        self.null_expert_count = 1
-
-        # Regular experts
-        self.experts = nn.ModuleList([MLP(config, bias=False) for _ in range(self.n_routed_experts)])
-
-        # Special experts
-        self.shared_expert = nn.ModuleList([MLP(config, bias=False) for _ in range(self.shared_expert_count)])
-        self.null_expert = nn.ModuleList([MLP(config, bias=False) for _ in range(self.null_expert_count)])
-
-        # Router (gate) is a trainable linear layer
-        self.gate = nn.Linear(self.hidden_size, self.n_routed_experts, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Compute router logits
-        router_logits = self.gate(x)
-
-        # Fast path: single expert (no routing needed)
-        if self.n_routed_experts == 1:
-            return self.experts[0](x)
-
-        # Compute routing weights
-        routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float)
-
-        # Select top-k experts per token
-        routing_weights, selected_experts = torch.topk(
-            routing_weights, self.num_experts_per_tok, dim=-1
-        )
-        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
-
-        # Flatten for processing
-        x_reshaped = x.view(-1, x.size(-1))
-        selected_experts_reshaped = selected_experts.view(-1, self.num_experts_per_tok)
-        routing_weights_reshaped = routing_weights.view(-1, self.num_experts_per_tok)
-
-        # Prepare output
-        final_output = torch.zeros_like(x_reshaped)
-
-        # Process each expert
-        for expert_idx, expert in enumerate(self.experts):
-            # Boolean mask of tokens going to this expert
-            mask = (selected_experts_reshaped == expert_idx)
-            if not mask.any():
-                continue
-
-            # Indices of tokens routed here
-            token_idx = mask.any(dim=1).nonzero(as_tuple=True)[0]
-            if token_idx.numel() == 0:
-                continue
-
-            # Gather input for this expert
-            current_input = x_reshaped[token_idx]
-
-            # Gather weights safely using mask
-            current_weights = (routing_weights_reshaped[token_idx] * mask[token_idx]).sum(dim=1, keepdim=True)
-
-            # Expert forward
-            expert_output = expert(current_input)
-
-            # Weighted sum into output
-            final_output[token_idx] += current_weights * expert_output
-
-        return final_output.view_as(x)
-
-
-
-class Attention(nn.Module):
-    def __init__(self, config: MoEModelConfig, layer_idx: Optional[int] = None):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-
-        self.head_dim = config.hidden_size // config.num_attention_heads
-        self.hidden_size = config.hidden_size
-        self.num_attention_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
-        self.num_groups = self.num_attention_heads // self.num_kv_heads
-        self.dropout = config.dropout
-
-        # Projection layers
-        self.q_proj = nn.Linear(config.hidden_size, self.num_attention_heads * self.head_dim, bias=True)
-        self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=True)
-        self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=True)
-        self.o_proj = nn.Linear(self.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
-
-        # Scaling factor
-        self.scale = 1.0 / math.sqrt(self.head_dim)
-
-        if self.num_attention_heads % self.num_kv_heads != 0:
-            raise ValueError("num_attention_heads must be divisible by num_kv_heads")
-
-    def _prepare_qkv(self, hidden_states: torch.Tensor, position_ids: torch.Tensor):
-        bsz, seq_len, _ = hidden_states.shape
-
-        # Project to Q/K/V
-        q = self.q_proj(hidden_states).view(bsz, seq_len, self.num_attention_heads, self.head_dim)
-        k = self.k_proj(hidden_states).view(bsz, seq_len, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(hidden_states).view(bsz, seq_len, self.num_kv_heads, self.head_dim)
-
-        # Transpose for attention: [B, H, L, D]
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        # Repeat KV heads if needed
-        if self.num_kv_heads != self.num_attention_heads:
-            repeat_factor = self.num_attention_heads // self.num_kv_heads
-            k = k.repeat_interleave(repeat_factor, dim=1)
-            v = v.repeat_interleave(repeat_factor, dim=1)
-
-        return q, k, v
-    
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        output_attentions: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        batch_size, seq_len, _ = hidden_states.shape
-
-        if position_ids is None:
-            raise ValueError("position_ids must be provided")
-        if position_ids.dim() == 1:
-            position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
-        position_ids = position_ids.to(hidden_states.device).long()
-
-        q, k, v = self._prepare_qkv(hidden_states, position_ids)
-
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(dtype=q.dtype, device=q.device)
-
-        attn_output = F.scaled_dot_product_attention(
-            query=q,
-            key=k,
-            value=v,
-            attn_mask=attention_mask,
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=False
-        )
-
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
-        attn_output = self.o_proj(attn_output)
-
-        attn_probs = None
-        if output_attentions:
-            attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            if attention_mask is not None:
-                attn_scores += attention_mask
-            attn_probs = F.softmax(attn_scores, dim=-1)
-
-        if attn_output is None:
-            raise RuntimeError("Attention output is None — check dtype/device issues!")
-
-        return attn_output, attn_probs
-    
 class DecoderLayer(nn.Module):
     """DecoderLayer with optional MoE MLP layer."""
     
@@ -277,7 +26,11 @@ class DecoderLayer(nn.Module):
         if config.use_moe:
             self.mlp = MoE(config)
         else:
-            self.mlp = MLP(config, bias=False)
+            self.mlp = MLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                dropout=config.dropout
+            )
 
     def forward(
         self,
@@ -294,11 +47,16 @@ class DecoderLayer(nn.Module):
         # MLP with residual connection
         residual = x
         x = self.post_attention_layernorm(x)
-        x = self.mlp(x)
+        mlp_out = self.mlp(x)
+
+        # Unwrap MoEOutput if MoE is being used
+        if isinstance(mlp_out, MoEOutput):
+            x = mlp_out.last_hidden_state
+        else:
+            x = mlp_out
+
         x = residual + x
-
         return x
-
 
 class Transformer(nn.Module):
     """Transformer model with optional MoE layers."""
@@ -322,12 +80,12 @@ class Transformer(nn.Module):
         ])
         self.norm = RMSNorm(config.hidden_size)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
+    
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> CausalLMOutput:
         batch_size, seq_len = input_ids.shape
 
         # Create position_ids
@@ -350,7 +108,14 @@ class Transformer(nn.Module):
         # Compute logits
         logits = self.lm_head(x)
 
-        return logits
+        # Return in HF-friendly format
+        return CausalLMOutput(
+            loss=None,
+            logits=logits,
+            hidden_states=None,
+            attentions=None
+        )
+
 
     def _create_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
         mask = torch.full((seq_len, seq_len), float("-inf"), device=device)
@@ -453,7 +218,11 @@ def copy_dense_to_moe(dense_model: Transformer, moe_model: Transformer) -> Trans
                 expert_layer_name = parts[-2]
                 param_name = parts[-1]
 
-                dense_key = f"layers.{layer_idx}.mlp.{expert_layer_name}.{param_name}"
+                # Handle null_expert (no .0 in path)
+                if "null_expert" in key:
+                    dense_key = f"layers.{layer_idx}.mlp.{expert_layer_name}.{param_name}"
+                else:
+                    dense_key = f"layers.{layer_idx}.mlp.{expert_layer_name}.{param_name}"
 
                 # Load the dense parameter
                 if dense_key in dense_sd:
@@ -491,53 +260,9 @@ def save_moe_model(model: Transformer, path: Union[str, Path] = "model.safetenso
     save_file(state_dict, path)
     print(f"✅ MoE model saved to {path}")
 
-if __name__ == "__main__":
-    # Dense model config
-    dense_config = MoEModelConfig(
-        hidden_size=896,
-        intermediate_size=4864,
-        num_hidden_layers=24,
-        num_attention_heads=14,
-        num_key_value_heads=2,
-        vocab_size=151936,
-    )
-
-    # MoE config 
-    moe_config = MoEModelConfig(
-        hidden_size=896,
-        intermediate_size=4864,
-        num_hidden_layers=24,
-        num_attention_heads=14,
-        num_key_value_heads=2,
-        vocab_size=151936,
-
-        # MoE-specific params
-        use_moe=True,
-        n_routed_experts=6,
-        num_experts_per_tok=2,
-        n_group=2,
-        topk_group=1,
-    )
-
-    # Select device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Load dense model directly on GPU (or selected device)
-    print("Loading original dense model on device...")
-    dense_model = load_model_from_safetensors("model.safetensors", dense_config, device=device).half()
-    print(f"Dense model loaded on {device}")
-
-    # Create MoE model on GPU
-    print("Creating MoE model and copying weights...")
-    moe_model = copy_dense_to_moe(dense_model, Transformer(moe_config).to(device).half())
-    print("MoE model Ready...")
-
-    save_moe_model(moe_model, "moe.safetensors")
-
-# Last cell
-
 def load_tokenizer_from_json(tokenizer_path: str):
     """Load tokenizer from tokenizer.json file"""
+    from transformers import PreTrainedTokenizerFast
     tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_path)
 
     # Add padding token if not present
@@ -557,70 +282,55 @@ def generate_text(
 ):
     model.eval()
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
-    
+
     generated = input_ids
     with torch.no_grad():
         for _ in range(max_new_tokens):
-            logits = model(generated)[:, -1, :]  # last token logits
-            
+            # Call model and grab logits from CausalLMOutput
+            output = model(generated)
+            logits = output.logits[:, -1, :]  # only last token
+
             if temperature != 1.0:
                 logits = logits / temperature
-            
+
             if top_k > 0:
                 # Top-k filtering
                 values, indices = torch.topk(logits, top_k)
                 mask = torch.full_like(logits, float("-inf"))
                 mask.scatter_(1, indices, values)
                 logits = mask
-            
+
             probs = torch.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
-            
+
             generated = torch.cat((generated, next_token), dim=1)
-            
+
             # Stop on EOS
             if next_token.item() == tokenizer.eos_token_id:
                 break
-    
+
     return tokenizer.decode(generated[0].tolist(), skip_special_tokens=True)
 
 if __name__ == "__main__":
     # Dense model config
-    dense_config = MoEModelConfig(
-        hidden_size=896,
-        intermediate_size=4864,
-        num_hidden_layers=24,
-        num_attention_heads=14,
-        num_key_value_heads=2,
-        vocab_size=151936,
-    )
+    dense_config = MoEModelConfig()
 
     # MoE config 
-    moe_config = MoEModelConfig(
-        hidden_size=896,
-        intermediate_size=4864,
-        num_hidden_layers=24,
-        num_attention_heads=14,
-        num_key_value_heads=2,
-        vocab_size=151936,
+    moe_config = MoEModelConfig()
 
-        # MoE-specific params
-        use_moe=True,
-        n_routed_experts=6,
-        num_experts_per_tok=2,
-        n_group=2,
-        topk_group=1,
-    )
     # Select device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    # Load dense model
-    print("Loading original dense model...")
-    dense_model = load_model_from_safetensors("model.safetensors", dense_config, device=device).half()
+    # Load dense model directly on GPU (or selected device)
+    print("Loading original dense model on device...")
+    dense_model = load_model_from_safetensors("model.safetensors", dense_config, device=device)
+    print(f"Dense model loaded on {device}")
 
-    # Create MoE model
-    print("Loading MoE model...")
-    moe_model = load_model_from_safetensors("moe.safetensors", moe_config, device=device).half()
+    # Create MoE model on GPU
+    print("Creating MoE model and copying weights...")
+    moe_model = copy_dense_to_moe(dense_model, Transformer(moe_config).to(device))
+    print("MoE model Ready...")
 
     # tie weights
     if hasattr(moe_model, "lm_head") and hasattr(moe_model, "embed_tokens"):
@@ -636,25 +346,55 @@ if __name__ == "__main__":
     print("Loading tokenizer...")
     tokenizer = load_tokenizer_from_json("tokenizer.json")
 
-    # Generate text
-    print("Running generation...")
-    output = generate_text(moe_model, tokenizer, "The future of AI is", max_new_tokens=50)
-    print("=== Generated Text ===")
-    print(output)
+    # Set models to evaluation mode
+    dense_model.eval()
+    moe_model.eval()
+    print("Models set to evaluation mode")
 
-    # Test equivalence
-    print("Testing model equivalence...")
-    test_input = torch.randint(0, 1000, (1, 10)).to(device)
+    # Generate text with both models for comparison
+    print("Running generation with both models...")
+    
+    # MoE generation
+    moe_output = generate_text(moe_model, tokenizer, "The future of AI is", max_new_tokens=50)
+    print("=== MoE Generated Text ===")
+    print(moe_output)
+    
+    # Dense generation for comparison
+    dense_output = generate_text(dense_model, tokenizer, "The future of AI is", max_new_tokens=50)
+    print("=== Dense Generated Text ===")
+    print(dense_output)
 
-    with torch.no_grad():
-        dense_output = dense_model(test_input)
-        moe_output = moe_model(test_input)
+    # Test equivalence with multiple inputs for better verification
+    print("Testing model equivalence with multiple inputs...")
+    
+    # Create multiple test inputs
+    test_inputs = [
+        torch.randint(0, tokenizer.vocab_size, (1, 10)).to(device),
+        torch.randint(0, tokenizer.vocab_size, (1, 5)).to(device),
+        torch.randint(0, tokenizer.vocab_size, (1, 15)).to(device),
+    ]
+    
+    similarities = []
+    for i, test_input in enumerate(test_inputs):
+        with torch.no_grad():
+            dense_logits = dense_model(test_input).logits
+            moe_logits = moe_model(test_input).logits
+            
+            # Calculate multiple similarity metrics
+            cosine_sim = torch.cosine_similarity(dense_logits.flatten(), moe_logits.flatten(), dim=0)
+            mse = torch.nn.functional.mse_loss(dense_logits, moe_logits)
+            
+            similarities.append((cosine_sim.item(), mse.item()))
+            
+            print(f"Test {i+1}: Cosine similarity = {cosine_sim.item():.8f}, MSE = {mse.item():.8f}")
+    
+    # Calculate average similarity
+    avg_cosine_sim = sum(s[0] for s in similarities) / len(similarities)
+    print(f"Average cosine similarity: {avg_cosine_sim:.8f}")
 
-    similarity = torch.cosine_similarity(dense_output.flatten(), moe_output.flatten(), dim=0)
-    print(f"Cosine similarity between dense and MoE outputs: {similarity.item():.8f}")
-
-    if similarity.item() > 0.999:
+    if avg_cosine_sim > 0.9999:
         print("✅ SUCCESS: MoE model behaves identically to the dense model!")
     else:
         print("❌ FAILURE: Outputs are not similar enough.")
-
+        
+    save_moe_model(moe_model, "moe.safetensors")
